@@ -29,7 +29,7 @@ module Bosh::AzureCloud
         'resourceManagerEndpointUrl' => 'https://management.chinacloudapi.cn/',
         'activeDirectoryEndpointUrl' => 'https://login.chinacloudapi.cn',
         'apiVersion' => {
-          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2015-06-15',
+          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2016-04-30-preview',
           AZURE_RESOURCE_PROVIDER_NETWORK          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_STORAGE          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_GROUP            => '2016-06-01',
@@ -40,7 +40,7 @@ module Bosh::AzureCloud
         'resourceManagerEndpointUrl' => 'https://management.usgovcloudapi.net/',
         'activeDirectoryEndpointUrl' => 'https://login.microsoftonline.com',
         'apiVersion' => {
-          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2015-06-15',
+          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2016-04-30-preview',
           AZURE_RESOURCE_PROVIDER_NETWORK          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_STORAGE          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_GROUP            => '2016-06-01',
@@ -60,7 +60,7 @@ module Bosh::AzureCloud
         'resourceManagerEndpointUrl' => 'https://management.microsoftazure.de/',
         'activeDirectoryEndpointUrl' => 'https://login.microsoftonline.de',
         'apiVersion' => {
-          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2015-06-15',
+          AZURE_RESOURCE_PROVIDER_COMPUTE          => '2016-04-30-preview',
           AZURE_RESOURCE_PROVIDER_NETWORK          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_STORAGE          => '2015-06-15',
           AZURE_RESOURCE_PROVIDER_GROUP            => '2016-06-01',
@@ -112,6 +112,13 @@ module Bosh::AzureCloud
       "migrated" => "true"
     }
 
+    OS_TYPE_LINUX                               = 'linux'
+    OS_TYPE_WINDOWS                             = 'windows'
+    IMAGE_SIZE_IN_MB_LINUX                      = 3 * 1024
+    IMAGE_SIZE_IN_MB_WINDOWS                    = 128 * 1024
+    MINIMUM_REQUIRED_OS_DISK_SIZE_IN_GB_LINUX   = 30
+    MINIMUM_REQUIRED_OS_DISK_SIZE_IN_GB_WINDOWS = 128
+
     # Lock
     BOSH_LOCK_EXCEPTION_TIMEOUT        = 'timeout'
     BOSH_LOCK_EXCEPTION_LOCK_NOT_FOUND = 'lock_not_found'
@@ -124,6 +131,7 @@ module Bosh::AzureCloud
     # REST Connection Errors
     ERROR_OPENSSL_RESET           = 'SSL_connect'
     ERROR_SOCKET_UNKNOWN_HOSTNAME = 'SocketError: Hostname not known'
+    ERROR_CONNECTION_REFUSED      = 'Connection refused'
 
     # Length of instance id
     UUID_LENGTH                   = 36
@@ -133,6 +141,9 @@ module Bosh::AzureCloud
     AZURESTACK_AUTHENTICATION_TYPE_AZURESTACK   = 'AzureStack'
     AZURESTACK_AUTHENTICATION_TYPE_AZURESTACKAD = 'AzureStackAD'
     AZURESTACK_AUTHENTICATION_TYPE_AZUREAD      = 'AzureAD'
+
+    BOSH_JOBS_DIR = '/var/vcap/jobs'
+    AZURESTACK_CA_FILE_RELATIVE_PATH = 'azure_cpi/config/azure_stack_ca_cert.pem'
 
     ##
     # Raises CloudError exception
@@ -210,43 +221,30 @@ module Bosh::AzureCloud
       return url, api_version
     end
 
-    def initialize_azure_storage_client(storage_account, service = 'blob', use_http = false)
-      azure_client = Azure::Storage::Client.create(storage_account_name: storage_account[:name], storage_access_key: storage_account[:key], user_agent_prefix: USER_AGENT_FOR_REST)
+    def initialize_azure_storage_client(storage_account, azure_properties)
+      options = {
+        :storage_account_name => storage_account[:name],
+        :storage_access_key   => storage_account[:key],
+        :storage_dns_suffix   => URI.parse(storage_account[:storage_blob_host]).host.split(".")[2..-1].join("."),
+        :user_agent_prefix    => USER_AGENT_FOR_REST
+      }
 
-      case service
-        when 'blob'
-          if storage_account[:storage_blob_host].end_with?('/')
-            azure_client.storage_blob_host  = storage_account[:storage_blob_host].chop
-          else
-            azure_client.storage_blob_host  = storage_account[:storage_blob_host]
-          end
-
-          if use_http
-            azure_client.storage_blob_host.gsub!('https', 'http')
-            azure_client.storage_blob_host.gsub!(':443', '')
-          end
-          @logger.debug("initialize_azure_storage_client - storage_blob_host: #{azure_client.storage_blob_host}")
-        when 'table'
-          if storage_account[:storage_table_host].nil?
-            cloud_error("The storage account `#{storage_account[:name]}' does not support table")
-          end
-
-          if storage_account[:storage_table_host].end_with?('/')
-            azure_client.storage_table_host = storage_account[:storage_table_host].chop
-          else
-            azure_client.storage_table_host = storage_account[:storage_table_host]
-          end
-
-          if use_http
-            azure_client.storage_table_host.gsub!('https', 'http')
-            azure_client.storage_table_host.gsub!(':443', '')
-          end
-          @logger.debug("initialize_azure_storage_client - storage_table_host: #{azure_client.storage_table_host}")
+      if azure_properties['environment'] == ENVIRONMENT_AZURESTACK
+        use_http = azure_properties['azure_stack']['use_http_to_access_storage_account']
+        if use_http
+          options[:default_endpoints_protocol] = 'http'
         else
-          cloud_error("No support for the storage service: `#{service}'")
+          options[:ca_file] = get_ca_file_path
+        end
       end
 
-      azure_client
+      Azure::Storage::Client.create(options)
+    end
+
+    def get_ca_file_path
+      # The environment variable BOSH_JOBS_DIR only exists when deploying BOSH director
+      bosh_jobs_dir = ENV['BOSH_JOBS_DIR'].nil? ? BOSH_JOBS_DIR : ENV['BOSH_JOBS_DIR']
+      "#{bosh_jobs_dir}/#{AZURESTACK_CA_FILE_RELATIVE_PATH}"
     end
 
     def get_api_version(azure_properties, resource_provider)
@@ -257,7 +255,7 @@ module Bosh::AzureCloud
       validate_disk_size_type(size)
 
       cloud_error('Azure CPI minimum disk size is 1 GiB') if size < 1024
-      cloud_error('Azure CPI maximum disk size is 1023 GiB') if size > 1023 * 1024
+      cloud_error('Azure CPI maximum disk size is 4095 GiB') if size > 4095 * 1024
     end
 
     def validate_disk_size_type(size)
@@ -279,7 +277,7 @@ module Bosh::AzureCloud
     # size: The default ephemeral disk size for the instance type
     #   Reference Azure temporary disk size as the ephemeral disk size
     #   If the size is less than 30 GiB, CPI uses 30 GiB because the space may not be enough. You can find the temporary disk size in the comment if it is less than 30 GiB
-    #   If the size is larger than 1,023 GiB, CPI uses 1,023 GiB because max data disk size is 1,023 GiB on Azure. You can find the temporary disk size in the comment if it is larger than 1,023 GiB
+    #   If the size is larger than 1,000 GiB, CPI uses 1,000 GiB because it is not expected to use such a large ephemeral disk in CF currently. You can find the temporary disk size in the comment if it is larger than 1,000 GiB
     # count: The maximum number of data disks for the instance type
     #   The maximum number of data disks on Azure for now is 64. Set it to 64 if instance_type cannot be found in case a new instance type is supported in future
     class DiskInfo
@@ -297,6 +295,15 @@ module Bosh::AzureCloud
         'STANDARD_A9'  => [382, 16],
         'STANDARD_A10' => [382, 16],
         'STANDARD_A11' => [382, 16],
+
+        # Av2-series
+        'STANDARD_A1_V2'   => [30, 2], #10 GiB
+        'STANDARD_A2_V2'   => [30, 4], #20 GiB
+        'STANDARD_A4_V2'   => [40, 8],
+        'STANDARD_A8_V2'   => [80, 16],
+        'STANDARD_A2M_V2'  => [30, 4], #20 GiB
+        'STANDARD_A4M_V2'  => [40, 8],
+        'STANDARD_A8M_V2'  => [80, 16],
 
         # D-series
         'STANDARD_D1'  => [50, 2],
@@ -318,7 +325,7 @@ module Bosh::AzureCloud
         'STANDARD_D12_V2' => [200, 8],
         'STANDARD_D13_V2' => [400, 16],
         'STANDARD_D14_V2' => [800, 32],
-        'STANDARD_D15_V2' => [1023, 40], # 1024 GiB
+        'STANDARD_D15_V2' => [1000, 40],
 
         # DS-series
         'STANDARD_DS1'  => [30, 2], # 7 GiB
@@ -359,16 +366,45 @@ module Bosh::AzureCloud
         # G-series
         'STANDARD_G1'  => [384, 4],
         'STANDARD_G2'  => [768, 8],
-        'STANDARD_G3'  => [1023, 16], # 1,536 GiB
-        'STANDARD_G4'  => [1023, 32], # 3,072 GiB
-        'STANDARD_G5'  => [1023, 64], # 6,144 GiB
+        'STANDARD_G3'  => [1000, 16], # 1536 GiB
+        'STANDARD_G4'  => [1000, 32], # 3072 GiB
+        'STANDARD_G5'  => [1000, 64], # 6144 GiB
 
         # Gs-series
         'STANDARD_GS1'  => [56, 4],
         'STANDARD_GS2'  => [112, 8],
         'STANDARD_GS3'  => [224, 16],
         'STANDARD_GS4'  => [448, 32],
-        'STANDARD_GS5'  => [896, 64]
+        'STANDARD_GS5'  => [896, 64],
+
+        #Ls-series
+        'STANDARD_L4S'  => [678, 8],
+        'STANDARD_L8S'  => [1000, 16], # 1388 GiB
+        'STANDARD_L16S' => [1000, 32], # 2807 GiB
+        'STANDARD_L32S' => [1000, 64], # 5630 GiB
+
+        #M-series
+        'STANDARD_M64MS' => [1000, 32], # 2048 GiB
+        'STANDARD_M128S' => [1000, 64], # 4096 GiB
+
+        #NV-series
+        'STANDARD_NV6'  => [380, 8],
+        'STANDARD_NV12' => [680, 16],
+        'STANDARD_NV24' => [1000, 32], # 1440 GiB
+
+        #NC-series
+        'STANDARD_NC6'   => [380, 8],
+        'STANDARD_NC12'  => [680, 16],
+        'STANDARD_NC24'  => [1000, 32], # 1440 GiB
+        'STANDARD_NC24R' => [1000, 32], # 1440 GiB
+
+        #H-series
+        'STANDARD_8'    => [1000, 16],
+        'STANDARD_16'   => [1000, 32], # 2000 GiB
+        'STANDARD_8M'   => [1000, 16],
+        'STANDARD_16M'  => [1000, 32], # 2000 GiB
+        'STANDARD_16R'  => [1000, 32], # 2000 GiB
+        'STANDARD_16MR' => [1000, 32]  # 2000 GiB
       }
 
       attr_reader :size, :count
@@ -389,19 +425,21 @@ module Bosh::AzureCloud
     end
 
     # Stemcell information
-    # * +:uri+      - String. uri of the blob stemcell, e.g. "https://<storage-account-name>.blob.core.windows.net/stemcell/bosh-stemcell-82817f34-ae10-4cfe-8ca8-b18d18ee5cdd.vhd"
-    #                         id of the image stemcell, e.g. "/subscriptions/<subscription-id>/resourceGroups/<resource-group-name>/providers/Microsoft.Compute/images/bosh-stemcell-d42a792c-db7a-45a6-8132-e03c863c9f01-Standard_LRS-southeastasia"
-    # * +:os_type+  - String. os type of the stemcell, e.g. "linux"
-    # * +:name+     - String. name of the stemcell, e.g. "bosh-azure-hyperv-ubuntu-trusty-go_agent"
-    # * +:version   - String. version of the stemcell, e.g. "2972"
-    # * +:disk_size - Integer. disk size in MiB, e.g. 3072
-    # * +:image     - Hash. It is nil when the stemcell is not a light stemcell.
-    # *   +publisher+      - String. The publisher of the platform image.
-    # *   +offer+          - String. The offer from the publisher.
-    # *   +sku+            - String. The sku of the publisher's offer.
-    # *   +version+        - String. The version of the sku.
+    # * +:uri+         - String. uri of the blob stemcell, e.g. "https://<storage-account-name>.blob.core.windows.net/stemcell/bosh-stemcell-82817f34-ae10-4cfe-8ca8-b18d18ee5cdd.vhd"
+    #                            id of the image stemcell, e.g. "/subscriptions/<subscription-id>/resourceGroups/<resource-group-name>/providers/Microsoft.Compute/images/bosh-stemcell-d42a792c-db7a-45a6-8132-e03c863c9f01-Standard_LRS-southeastasia"
+    # * +:os_type+     - String. os type of the stemcell, e.g. "linux"
+    # * +:name+        - String. name of the stemcell, e.g. "bosh-azure-hyperv-ubuntu-trusty-go_agent"
+    # * +:version      - String. version of the stemcell, e.g. "2972"
+    # * +:image_size   - Integer. size in MiB of the image.
+    #                             For a normal stemcell, the value should be the size of root.vhd.
+    #                             For a light stemcell, the value should be the size of the platform image.
+    # * +:image        - Hash. It is nil when the stemcell is not a light stemcell.
+    # *   +publisher+    - String. The publisher of the platform image.
+    # *   +offer+        - String. The offer from the publisher.
+    # *   +sku+          - String. The sku of the publisher's offer.
+    # *   +version+      - String. The version of the sku.
     class StemcellInfo
-      attr_reader :uri, :metadata, :os_type, :name, :version, :disk_size, :image
+      attr_reader :uri, :metadata, :os_type, :name, :version, :image_size, :image
 
       def initialize(uri, metadata)
         @uri = uri
@@ -409,7 +447,11 @@ module Bosh::AzureCloud
         @os_type = @metadata['os_type'].nil? ? 'linux': @metadata['os_type'].downcase
         @name = @metadata['name']
         @version = @metadata['version']
-        @disk_size = @metadata['disk'].nil? ? 3072 : @metadata['disk'].to_i
+        if @metadata['disk'].nil?
+          @image_size = is_windows? ? IMAGE_SIZE_IN_MB_WINDOWS : IMAGE_SIZE_IN_MB_LINUX
+        else
+          @image_size = @metadata['disk'].to_i
+        end
         @image = @metadata['image']
       end
 
@@ -418,7 +460,7 @@ module Bosh::AzureCloud
       end
 
       def is_windows?
-        @os_type == 'windows'
+        @os_type == OS_TYPE_WINDOWS
       end
 
       # This will be used when creating VMs
@@ -433,6 +475,29 @@ module Bosh::AzureCloud
           'version'   => @image['version']
         }
       end
+    end
+
+    def get_os_disk_size(root_disk_size, stemcell_info, use_root_disk)
+      disk_size = nil
+      image_size = stemcell_info.image_size
+      unless root_disk_size.nil?
+        validate_disk_size_type(root_disk_size)
+        if root_disk_size < image_size
+          @logger.warn("root_disk.size `#{root_disk_size}' MiB is smaller than the default OS disk size `#{image_size}' MiB. root_disk.size is ignored and use `#{image_size}' MiB as root disk size.")
+          root_disk_size = image_size
+        end
+        disk_size = (root_disk_size/1024.0).ceil
+        validate_disk_size(disk_size*1024)
+      end
+
+      # When using OS disk to store the ephemeral data and root_disk.size is not set, CPI will resize the OS disk size.
+      # For Linux,   the size of the VHD in the stemcell is 3   GiB. CPI will resize it to the high value between the minimum disk size and 30  GiB;
+      # For Windows, the size of the VHD in the stemcell is 128 GiB. CPI will resize it to the high value between the minimum disk size and 128 GiB.
+      if disk_size.nil? && use_root_disk
+        minimum_required_disk_size = stemcell_info.is_windows? ? MINIMUM_REQUIRED_OS_DISK_SIZE_IN_GB_WINDOWS : MINIMUM_REQUIRED_OS_DISK_SIZE_IN_GB_LINUX
+        disk_size = (image_size/1024.0).ceil < minimum_required_disk_size ? minimum_required_disk_size : (image_size/1024.0).ceil
+      end
+      disk_size
     end
 
     # File Mutex

@@ -58,7 +58,7 @@ module Bosh::AzureCloud
     REST_API_STORAGE_ACCOUNTS            = 'storageAccounts'
 
     # Please add the key into this list if you want to redact its value in request body.
-    CREDENTIAL_KEYWORD_LIST = ['adminPassword', 'client_secret']
+    CREDENTIAL_KEYWORD_LIST = ['adminPassword', 'client_secret', 'customData']
 
     def initialize(azure_properties, logger)
       @logger = logger
@@ -207,6 +207,8 @@ module Bosh::AzureCloud
     # *   +:disk_caching+       - String. The caching option of the ephemeral disk. Possible values: None, ReadOnly or ReadWrite.
     # *   +:disk_size+          - Integer. The size in GiB of the ephemeral disk.
     #
+    #   When debug_mode is on, CPI will use below parameter for boot diagnostics
+    # * +:diag_storage_uri      - String. Diagnostics storage account URI.
     #
     # @return [Boolean]
     #
@@ -343,6 +345,15 @@ module Bosh::AzureCloud
       unless availability_set.nil?
         vm['properties']['availabilitySet'] = {
           'id' => availability_set[:id]
+        }
+      end
+
+      unless vm_params[:diag_storage_uri].nil?
+        vm['properties']['diagnosticsProfile'] = {
+          'bootDiagnostics' => {
+            'enabled' => true,
+            'storageUri' => vm_params[:diag_storage_uri]
+          }
         }
       end
 
@@ -589,6 +600,9 @@ module Bosh::AzureCloud
             vm[:network_interfaces].push(network_interface)
           end
         end
+
+        boot_diagnostics = properties.fetch('diagnosticsProfile', {}).fetch('bootDiagnostics', {})
+        vm[:diag_storage_uri] = boot_diagnostics['storageUri'] if boot_diagnostics['enabled']
       end
       vm
     end
@@ -1854,12 +1868,23 @@ module Bosh::AzureCloud
     def redact_credentials_in_request_body(body)
       is_debug_mode(@azure_properties) ? body.to_json : redact_credentials(CREDENTIAL_KEYWORD_LIST, body).to_json
     end
+    
+    def redact_credentials_in_response_body(body)
+      is_debug_mode(@azure_properties) ? body : redact_credentials(CREDENTIAL_KEYWORD_LIST, JSON.parse(body)).to_json
+    rescue => e
+      body
+    end
 
     def http(uri)
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = true
-      if @azure_properties['environment'] == ENVIRONMENT_AZURESTACK && @azure_properties['azure_stack']['skip_ssl_validation']
-        http.verify_mode = OpenSSL::SSL::VERIFY_NONE 
+      if @azure_properties['environment'] == ENVIRONMENT_AZURESTACK
+        if @azure_properties['azure_stack']['skip_ssl_validation']
+          http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+        else
+          # The CA cert is only specified for the requests to AzureStack domain. If specified for other domains, the request will fail.
+          http.ca_file = get_ca_file_path if uri.host.include?(@azure_properties['azure_stack']['domain'])
+        end
       end
       # The default value for read_timeout is 60 seconds.
       # The default value for open_timeout is nil before ruby 2.3.0 so set it to 60 seconds here.
@@ -1917,11 +1942,18 @@ module Bosh::AzureCloud
           raise e
         rescue => e
           # Below error message depends on require "resolv-replace.rb" in lib/cloud/azure.rb
-          if e.inspect.include?(ERROR_SOCKET_UNKNOWN_HOSTNAME) && retry_count < AZURE_MAX_RETRY_COUNT
-            @logger.warn("get_token - Fail for a DNS resolve error. Will retry after #{retry_after} seconds.")
-            retry_count += 1
-            sleep(retry_after)
-            retry
+          if retry_count < AZURE_MAX_RETRY_COUNT
+            if e.inspect.include?(ERROR_SOCKET_UNKNOWN_HOSTNAME)
+              @logger.warn("get_token - Fail for a DNS resolve error. Will retry after #{retry_after} seconds.")
+              retry_count += 1
+              sleep(retry_after)
+              retry
+            elsif e.inspect.include?(ERROR_CONNECTION_REFUSED)
+              @logger.warn("get_token - Fail for a connection refused error. Will retry after #{retry_after} seconds.")
+              retry_count += 1
+              sleep(retry_after)
+              retry
+            end
           end
           cloud_error("get_token - #{e.inspect}\n#{e.backtrace.join("\n")}")
         end
@@ -1983,7 +2015,7 @@ module Bosh::AzureCloud
         else
           message = "http_get_response - #{retry_count}: #{status_code}\n"
           message += get_http_common_headers(response)
-          message += "responsey.body: #{response.body}"
+          message += "response.body: #{redact_credentials_in_response_body(response.body)}"
           @logger.debug(message)
         end
 
@@ -2021,11 +2053,18 @@ module Bosh::AzureCloud
         raise e
       rescue => e
         # Below error message depends on require "resolv-replace.rb" in lib/cloud/azure.rb
-        if e.inspect.include?(ERROR_SOCKET_UNKNOWN_HOSTNAME) && retry_count < AZURE_MAX_RETRY_COUNT
-          @logger.warn("http_get_response - Fail for a DNS resolve error. Will retry after #{retry_after} seconds.")
-          retry_count += 1
-          sleep(retry_after)
-          retry
+        if retry_count < AZURE_MAX_RETRY_COUNT
+          if e.inspect.include?(ERROR_SOCKET_UNKNOWN_HOSTNAME)
+            @logger.warn("http_get_response - Fail for a DNS resolve error. Will retry after #{retry_after} seconds.")
+            retry_count += 1
+            sleep(retry_after)
+            retry
+          elsif e.inspect.include?(ERROR_CONNECTION_REFUSED)
+            @logger.warn("http_get_response - Fail for a connection refused error. Will retry after #{retry_after} seconds.")
+            retry_count += 1
+            sleep(retry_after)
+            retry
+          end
         end
         cloud_error("http_get_response - #{e.inspect}\n#{e.backtrace.join("\n")}")
       end

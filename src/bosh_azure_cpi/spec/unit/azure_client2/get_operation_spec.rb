@@ -712,6 +712,29 @@ describe Bosh::AzureCloud::AzureClient2 do
           azure_client2.get_storage_account_by_name(storage_account_name)
         }.not_to raise_error
       end
+      
+      it "should not raise error if it raises 'Connection refused - connect(2) for \"xx.xxx.xxx.xx\" port 443' at the first time but returns 200 at the second time" do
+        stub_request(:post, token_uri).to_return(
+          :status => 200,
+          :body => {
+            "access_token" => valid_access_token,
+            "expires_on" => expires_on
+          }.to_json,
+          :headers => {})
+        stub_request(:get, storage_account_uri).
+            to_raise('Connection refused - connect(2) for \"xx.xxx.xxx.xx\" port 443').then.
+            to_return(
+              {
+                :status => 200,
+                :body => '',
+                :headers => {}
+              }
+            )
+
+        expect {
+          azure_client2.get_storage_account_by_name(storage_account_name)
+        }.not_to raise_error
+      end
     end
 
     context "when token is valid, getting response succeeds" do
@@ -1252,6 +1275,176 @@ describe Bosh::AzureCloud::AzureClient2 do
           expect(
             azure_client2.get_virtual_machine_by_name(resource_group_name, vm_name)
           ).to eq(fake_vm)
+        end
+      end
+
+      context "when the vm has diagnosticsProfile specified" do
+        context "when boot diagnostics is not enabled" do
+          let(:response_body) {
+            {
+              "id"          => "fake-id",
+              "name"        => "fake-name",
+              "location"    => "fake-location",
+              "tags"        => {},
+              "properties"  => {
+                "provisioningState"  => "foo",
+                "hardwareProfile" => { "vmSize" => "bar" },
+                "storageProfile" => {
+                  "osDisk"  => {
+                    "name" => "foo",
+                    "caching" => "bar",
+                    "diskSizeGb" => 1024,
+                    "managedDisk" => {
+                      "id" => "fake-disk-id",
+                      "storageAccountType" => "fake-storage-account-type"
+                    }
+                  },
+                  "dataDisks" => []
+                },
+                "networkProfile" => {
+                  "networkInterfaces" => [
+                    {
+                      "id" => nic_id
+                    }
+                  ]
+                },
+                "diagnosticsProfile" => {
+                  "bootDiagnostics" => {
+                    "enabled" => false
+                  }
+                }
+              }
+            }.to_json
+          }
+
+          let(:fake_vm) {
+            {
+              :id          => "fake-id",
+              :name        => "fake-name",
+              :location    => "fake-location",
+              :tags        => {},
+              :provisioning_state  => "foo",
+              :vm_size => "bar",
+              :os_disk  => {
+                 :name => "foo",
+                 :caching => "bar",
+                 :size => 1024,
+                 :managed_disk => {
+                   :id => "fake-disk-id",
+                   :storage_account_type => "fake-storage-account-type"
+                 }
+              },
+              :data_disks => [],
+              :network_interfaces => [fake_nic]
+            }
+          }
+
+          it "should return correct value" do
+            stub_request(:get, public_ip_uri).to_return(
+              :status => 200,
+              :body => public_ip_response_body.to_json,
+              :headers => {})
+            stub_request(:get, load_balancer_uri).to_return(
+              :status => 200,
+              :body => load_balancer_response_body,
+              :headers => {})
+            stub_request(:get, nic_uri).to_return(
+              :status => 200,
+              :body => nic_response_body,
+              :headers => {})
+            stub_request(:get, vm_uri).to_return(
+              :status => 200,
+              :body => response_body,
+              :headers => {})
+            expect(
+              azure_client2.get_virtual_machine_by_name(resource_group_name, vm_name)
+            ).to eq(fake_vm)
+          end
+        end
+
+        context "when boot diagnostics is enabled" do
+          let(:response_body) {
+            {
+              "id"          => "fake-id",
+              "name"        => "fake-name",
+              "location"    => "fake-location",
+              "tags"        => {},
+              "properties"  => {
+                "provisioningState"  => "foo",
+                "hardwareProfile" => { "vmSize" => "bar" },
+                "storageProfile" => {
+                  "osDisk"  => {
+                    "name" => "foo",
+                    "caching" => "bar",
+                    "diskSizeGb" => 1024,
+                    "managedDisk" => {
+                      "id" => "fake-disk-id",
+                      "storageAccountType" => "fake-storage-account-type"
+                    }
+                  },
+                  "dataDisks" => []
+                },
+                "networkProfile" => {
+                  "networkInterfaces" => [
+                    {
+                      "id" => nic_id
+                    }
+                  ]
+                },
+                "diagnosticsProfile" => {
+                  "bootDiagnostics" => {
+                    "enabled" => true,
+                    "storageUri" => "fake-storage-uri"
+                  }
+                }
+              }
+            }.to_json
+          }
+
+          let(:fake_vm) {
+            {
+              :id          => "fake-id",
+              :name        => "fake-name",
+              :location    => "fake-location",
+              :tags        => {},
+              :provisioning_state  => "foo",
+              :vm_size => "bar",
+              :os_disk  => {
+                 :name => "foo",
+                 :caching => "bar",
+                 :size => 1024,
+                 :managed_disk => {
+                   :id => "fake-disk-id",
+                   :storage_account_type => "fake-storage-account-type"
+                 }
+              },
+              :data_disks => [],
+              :network_interfaces => [fake_nic],
+              :diag_storage_uri => "fake-storage-uri"
+            }
+          }
+
+          it "should return correct value" do
+            stub_request(:get, public_ip_uri).to_return(
+              :status => 200,
+              :body => public_ip_response_body.to_json,
+              :headers => {})
+            stub_request(:get, load_balancer_uri).to_return(
+              :status => 200,
+              :body => load_balancer_response_body,
+              :headers => {})
+            stub_request(:get, nic_uri).to_return(
+              :status => 200,
+              :body => nic_response_body,
+              :headers => {})
+            stub_request(:get, vm_uri).to_return(
+              :status => 200,
+              :body => response_body,
+              :headers => {})
+            expect(
+              azure_client2.get_virtual_machine_by_name(resource_group_name, vm_name)
+            ).to eq(fake_vm)
+          end
         end
       end
     end
